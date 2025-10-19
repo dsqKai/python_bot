@@ -13,12 +13,29 @@ from bot.services.state_manager import state_manager
 
 router = Router()
 
+def _format_settings_text(
+    daily_notify: bool,
+    notify_online: bool,
+    notification_time: str | None,
+    subgroup: int | None
+) -> str:
+    text = "⚙️ Настройки уведомлений\n\n"
+    text += f"Ежедневные: {'✅ Вкл' if daily_notify else '❌ Выкл'}\n"
+    if daily_notify and notification_time:
+        text += f"Время: {notification_time}\n"
+    text += f"Онлайн-пары: {'✅ Вкл' if notify_online else '❌ Выкл'}\n"
+    if subgroup:
+        text += f"Подгруппа: {subgroup}\n"
+    return text
+
 
 @router.message(Command("settings"))
-async def cmd_settings(message: Message, session: AsyncSession):
+async def cmd_settings(message: Message, session: AsyncSession, keyboard_cleanup_service=None):
     """Команда /settings - настройки уведомлений"""
-    user_id = message.from_user.id
+    # В callback'ах message.from_user может быть ботом (сообщение настроек от бота).
+    # В приватных чатах идентификатор пользователя равен chat.id, используем его.
     chat_id = message.chat.id
+    user_id = message.from_user.id if message.chat.type in ['group', 'supergroup'] else chat_id
     
     # Получаем настройки
     if message.chat.type in ['group', 'supergroup']:
@@ -43,13 +60,12 @@ async def cmd_settings(message: Message, session: AsyncSession):
         subgroup = user.subgroup
     
     # Формируем текст
-    text = "⚙️ Настройки уведомлений\n\n"
-    text += f"Ежедневные: {'✅ Вкл' if daily_notify else '❌ Выкл'}\n"
-    if daily_notify and notification_time:
-        text += f"Время: {notification_time}\n"
-    text += f"Онлайн-пары: {'✅ Вкл' if notify_online else '❌ Выкл'}\n"
-    if subgroup:
-        text += f"Подгруппа: {subgroup}\n"
+    text = _format_settings_text(
+        daily_notify,
+        notify_online,
+        notification_time,
+        subgroup
+    )
     
     keyboard = build_settings_keyboard(
         daily_notify,
@@ -58,13 +74,17 @@ async def cmd_settings(message: Message, session: AsyncSession):
         subgroup
     )
     
-    await message.answer(text, reply_markup=keyboard)
+    sent = await message.answer(text, reply_markup=keyboard)
+    # Планируем очистку клавиатуры по TTL (если сервис доступен)
+    if keyboard_cleanup_service:
+        await keyboard_cleanup_service.schedule_clear(sent.chat.id, sent.message_id)
 
 
 @router.callback_query(F.data.startswith("settings:"))
 async def process_settings_callback(
     callback: CallbackQuery,
-    session: AsyncSession
+    session: AsyncSession,
+    keyboard_cleanup_service=None
 ):
     """Обработка callback'ов настроек"""
     user_id = callback.from_user.id
@@ -83,6 +103,10 @@ async def process_settings_callback(
                 chat_id,
                 daily_notify_enabled=new_value
             )
+            daily_notify = new_value
+            notify_online = chat.notify_online
+            notification_time = chat.notification_time
+            subgroup = None
         else:
             user = await UserRepository.get_by_id(session, user_id)
             new_value = not user.daily_notify_enabled
@@ -91,10 +115,20 @@ async def process_settings_callback(
                 user_id,
                 daily_notify_enabled=new_value
             )
+            daily_notify = new_value
+            notify_online = user.notify_online
+            notification_time = user.notification_time
+            subgroup = user.subgroup
         
         await callback.answer(
             f"Ежедневные уведомления {'включены' if new_value else 'выключены'}"
         )
+        await callback.message.edit_text(
+            _format_settings_text(daily_notify, notify_online, notification_time, subgroup),
+            reply_markup=build_settings_keyboard(daily_notify, notify_online, notification_time, subgroup)
+        )
+        if keyboard_cleanup_service:
+            await keyboard_cleanup_service.schedule_clear(chat_id, callback.message.message_id)
     
     elif action == "toggle_online":
         # Переключить уведомления об онлайн-парах
@@ -106,6 +140,10 @@ async def process_settings_callback(
                 chat_id,
                 notify_online=new_value
             )
+            daily_notify = chat.daily_notify_enabled
+            notify_online = new_value
+            notification_time = chat.notification_time
+            subgroup = None
         else:
             user = await UserRepository.get_by_id(session, user_id)
             new_value = not user.notify_online
@@ -114,10 +152,20 @@ async def process_settings_callback(
                 user_id,
                 notify_online=new_value
             )
+            daily_notify = user.daily_notify_enabled
+            notify_online = new_value
+            notification_time = user.notification_time
+            subgroup = user.subgroup
         
         await callback.answer(
             f"Уведомления об онлайн-парах {'включены' if new_value else 'выключены'}"
         )
+        await callback.message.edit_text(
+            _format_settings_text(daily_notify, notify_online, notification_time, subgroup),
+            reply_markup=build_settings_keyboard(daily_notify, notify_online, notification_time, subgroup)
+        )
+        if keyboard_cleanup_service:
+            await keyboard_cleanup_service.schedule_clear(chat_id, callback.message.message_id)
     
     elif action == "change_time":
         # Изменить время уведомлений
@@ -125,10 +173,13 @@ async def process_settings_callback(
             'action': 'changing_notify_time'
         })
         
-        await callback.message.answer(
+        sent = await callback.message.answer(
             "🕐 Укажи время для ежедневных уведомлений в формате ЧЧ:ММ\n"
             "Например: 08:00"
         )
+        if keyboard_cleanup_service:
+            # На этом сообщении клавиатуры нет, но если появится — очистим
+            await keyboard_cleanup_service.schedule_clear(sent.chat.id, sent.message_id)
         await callback.answer()
         return
     
@@ -142,6 +193,8 @@ async def process_settings_callback(
             "👥 Выбери свою подгруппу:",
             reply_markup=build_subgroup_keyboard()
         )
+        if keyboard_cleanup_service:
+            await keyboard_cleanup_service.schedule_clear(chat_id, callback.message.message_id)
         await callback.answer()
         return
     
@@ -151,9 +204,8 @@ async def process_settings_callback(
         await callback.answer()
         return
     
-    # Обновляем сообщение с настройками
-    await cmd_settings(callback.message, session)
-    await callback.answer()
+    # Для остальных действий ответ уже отправлен выше
+    # и сообщение отредактировано при необходимости
 
 
 @router.callback_query(F.data.startswith("subgroup:"))

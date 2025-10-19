@@ -43,6 +43,8 @@ class Settings(BaseSettings):
     # Message Queue
     message_queue_max_workers: int = 5
     message_queue_rate_limit: int = 30
+    # Inline keyboard
+    inline_keyboard_ttl_seconds: int = 3600
     
     @property
     def database_url(self) -> str:

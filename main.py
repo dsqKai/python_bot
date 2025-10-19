@@ -22,6 +22,7 @@ from bot.middleware.rate_limit import RateLimitMiddleware
 from bot.middleware.auth import AuthMiddleware
 from bot.middleware.chat_registration import ChatRegistrationMiddleware
 from bot.middleware.message_queue import MessageQueueMiddleware
+from bot.middleware.keyboard_cleanup import KeyboardCleanupMiddleware
 from bot.middleware.metrics import MetricsMiddleware
 
 # Handlers
@@ -30,6 +31,7 @@ from bot.handlers import commands, settings as settings_handlers, feedback, admi
 # Services
 from bot.utils.message_queue import MessageQueue
 from bot.services.notification import NotificationService
+from bot.services.keyboard_cleanup import KeyboardCleanupService
 from bot.services.metrics_server import MetricsServer
 from bot.services.business_metrics import business_metrics_service
 
@@ -155,6 +157,12 @@ async def main():
     
     # Создаем сервис уведомлений
     notification_service = NotificationService(bot, message_queue)
+    # Сервис очистки клавиатур
+    keyboard_cleanup_service = KeyboardCleanupService(
+        bot,
+        message_queue,
+        default_ttl_seconds=settings.inline_keyboard_ttl_seconds
+    )
     
     # Создаем HTTP сервер для метрик
     metrics_server = MetricsServer(host='0.0.0.0', port=8000)
@@ -164,6 +172,7 @@ async def main():
     dp['message_queue'] = message_queue
     dp['notification_service'] = notification_service
     dp['metrics_server'] = metrics_server
+    dp['keyboard_cleanup_service'] = keyboard_cleanup_service
     
     # Регистрируем middleware (порядок важен!)
     dp.update.middleware(MetricsMiddleware())  # Метрики - первым для точного измерения
@@ -173,8 +182,10 @@ async def main():
     dp.message.middleware(RateLimitMiddleware())
     dp.message.middleware(AuthMiddleware())
     dp.message.middleware(MessageQueueMiddleware())
+    dp.message.middleware(KeyboardCleanupMiddleware())
     dp.callback_query.middleware(AuthMiddleware())
     dp.callback_query.middleware(MessageQueueMiddleware())
+    dp.callback_query.middleware(KeyboardCleanupMiddleware())
     
     # Регистрируем роутеры
     dp.include_router(commands.router)
