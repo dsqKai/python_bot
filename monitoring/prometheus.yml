@@ -1,0 +1,32 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    monitor: 'schedulebot-monitor'
+
+# Правила алертинга (опционально)
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets: []
+
+# Конфигурация сбора метрик
+scrape_configs:
+  # Метрики самого Prometheus
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # Метрики бота
+  - job_name: 'schedulebot'
+    static_configs:
+      - targets: ['schedulebot:8000']
+    metrics_path: '/metrics'
+    scrape_interval: 10s
+    scrape_timeout: 5s
+
+  # Метрики PostgreSQL (опционально, требует postgres_exporter)
+  # - job_name: 'postgres'
+  #   static_configs:
+  #     - targets: ['postgres-exporter:9187']
+
