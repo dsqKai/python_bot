@@ -25,6 +25,7 @@ __all__ = [
     'build_settings_keyboard',
     'build_subgroup_keyboard',
     'build_yes_no_keyboard',
+    'build_time_selection_keyboard',
     'build_skip_keyboard',
     'build_role_selection_keyboard',
     'MessageQueue',

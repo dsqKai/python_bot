@@ -11,10 +11,12 @@ from datetime import datetime, timedelta
 from database.repository import UserRepository, ChatRepository
 from bot.services.schedule import schedule_service
 from bot.services.tutorial import Tutorial
+from bot.services.onboarding import OnboardingFlow
 from bot.services.state_manager import state_manager
 from bot.utils import (
     extract_group_from_text,
-    build_role_selection_keyboard
+    build_role_selection_keyboard,
+    StateFilter
 )
 from loguru import logger
 
@@ -39,46 +41,50 @@ async def cmd_start(message: Message, session: AsyncSession):
         )
         return
     
-    # Новый пользователь - предлагаем выбрать роль
-    await message.answer(
-        "👋 Привет! Я бот для управления расписанием.\n"
-        "Давай начнем с выбора твоей роли:",
-        reply_markup=build_role_selection_keyboard()
-    )
-    
-    # Устанавливаем состояние
-    state_manager.set_state(chat_id, user_id, {
-        'action': 'choose_role'
-    })
+    # Новый пользователь — запускаем онбординг
+    flow = OnboardingFlow(message.bot, chat_id, user_id)
+    await flow.start(session)
 
 
 @router.callback_query(F.data.startswith("role:"))
 async def process_role_selection(callback: CallbackQuery, session: AsyncSession):
-    """Обработка выбора роли"""
+    """Обработка выбора роли (онбординг)"""
     user_id = callback.from_user.id
     chat_id = callback.message.chat.id
     role = callback.data.split(":")[1]
-    
-    # Создаем или обновляем пользователя
-    user = await UserRepository.get_by_id(session, user_id)
-    if user:
-        await UserRepository.update(session, user_id, role=role)
-    else:
-        await UserRepository.create(
-            session,
-            user_id=user_id,
-            role=role,
-            username=callback.from_user.username
-        )
-    
-    await callback.answer()
-    await callback.message.edit_text(
-        f"✅ Отлично! Ты выбрал роль: {'👨‍🎓 Студент' if role == 'student' else '👨‍🏫 Преподаватель'}\n\n"
-        f"Теперь укажи свою группу командой:\n"
-        f"/add 241-362"
-    )
-    
-    state_manager.delete_state(chat_id, user_id)
+    flow = OnboardingFlow(callback.bot, chat_id, user_id)
+    await flow.handle_role_selected(session, role, callback)
+
+@router.callback_query(F.data.startswith("onb:"))
+async def process_onboarding_callback(callback: CallbackQuery, session: AsyncSession):
+    user_id = callback.from_user.id
+    chat_id = callback.message.chat.id
+    flow = OnboardingFlow(callback.bot, chat_id, user_id)
+    handled = await flow.process_callback(session, callback)
+    if not handled:
+        await callback.answer()
+
+
+@router.callback_query(F.data.startswith("subg_onb:"))
+async def process_onboarding_subgroup(callback: CallbackQuery, session: AsyncSession):
+    """Хэндлер для выбора подгруппы во время онбординга"""
+    user_id = callback.from_user.id
+    chat_id = callback.message.chat.id
+    flow = OnboardingFlow(callback.bot, chat_id, user_id)
+    subgroup_raw = callback.data.split(":")[1]
+    await flow.handle_subgroup_callback(session, callback, subgroup_raw)
+
+
+@router.message(StateFilter(['onboarding']))
+async def process_onboarding_message(message: Message, session: AsyncSession):
+    """Обработка сообщений на шагах онбординга (группа, время)"""
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    flow = OnboardingFlow(message.bot, chat_id, user_id)
+    handled = await flow.process_message(session, message)
+    if not handled:
+        # Не мешаем остальным хэндлерам
+        return
 
 
 @router.message(Command("help"))
@@ -178,12 +184,11 @@ async def cmd_add_group(message: Message, session: AsyncSession):
             f"Теперь можешь использовать команды расписания."
         )
         
-        # Запускаем обучение, если пользователь новый
+        # Если пользователь новый — продолжим онбординг со следующего шага
         if not user or not user.tutorial_completed:
-            await UserRepository.update(session, user_id, tutorial_completed=True)
-            
-            tutorial = Tutorial(message.bot, chat_id, user_id)
-            await tutorial.start()
+            flow = OnboardingFlow(message.bot, chat_id, user_id)
+            # После сохранения группы переходим к выбору подгруппы
+            await flow._ask_subgroup()
 
 
 @router.message(Command("change_group"))

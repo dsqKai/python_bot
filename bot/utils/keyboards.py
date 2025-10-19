@@ -153,7 +153,7 @@ def build_settings_keyboard(
     return builder.as_markup()
 
 
-def build_subgroup_keyboard() -> InlineKeyboardMarkup:
+def build_subgroup_keyboard(prefix: str = "subgroup") -> InlineKeyboardMarkup:
     """
     Создать клавиатуру выбора подгруппы
     
@@ -163,14 +163,14 @@ def build_subgroup_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     
     builder.row(
-        InlineKeyboardButton(text="1️⃣ Подгруппа 1", callback_data="subgroup:1"),
-        InlineKeyboardButton(text="2️⃣ Подгруппа 2", callback_data="subgroup:2")
+        InlineKeyboardButton(text="1️⃣ Подгруппа 1", callback_data=f"{prefix}:1"),
+        InlineKeyboardButton(text="2️⃣ Подгруппа 2", callback_data=f"{prefix}:2")
     )
     builder.row(
-        InlineKeyboardButton(text="👥 Все", callback_data="subgroup:0")
+        InlineKeyboardButton(text="👥 Все", callback_data=f"{prefix}:0")
     )
     builder.row(
-        InlineKeyboardButton(text="◀️ Назад", callback_data="subgroup:back")
+        InlineKeyboardButton(text="◀️ Назад", callback_data=f"{prefix}:back")
     )
     
     return builder.as_markup()
@@ -197,6 +197,37 @@ def build_yes_no_keyboard(
         InlineKeyboardButton(text="❌ Нет", callback_data=no_callback)
     )
     
+    return builder.as_markup()
+
+
+def build_time_selection_keyboard(
+    times: List[str],
+    callback_prefix: str = "time"
+) -> InlineKeyboardMarkup:
+    """
+    Создать клавиатуру выбора времени + кнопка своего времени
+    
+    Args:
+        times: Список времени вида HH:MM
+        callback_prefix: Префикс для callback_data
+    
+    Returns:
+        InlineKeyboardMarkup
+    """
+    builder = InlineKeyboardBuilder()
+    # Время по 2 в ряд
+    row: List[InlineKeyboardButton] = []
+    for idx, t in enumerate(times):
+        row.append(InlineKeyboardButton(text=t, callback_data=f"{callback_prefix}:{t}"))
+        if (idx + 1) % 2 == 0:
+            builder.row(*row)
+            row = []
+    if row:
+        builder.row(*row)
+    # Кастомное время
+    builder.row(
+        InlineKeyboardButton(text="✏️ Другое время", callback_data=f"{callback_prefix}:custom")
+    )
     return builder.as_markup()
 
 
