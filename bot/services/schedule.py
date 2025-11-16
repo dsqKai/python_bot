@@ -903,9 +903,9 @@ class ScheduleService:
                         loc_str = "обе группы свободны, можно выбрать любую локацию"
                     else:
                         loc_str = f"обе группы в {locations[0]}"
-                    response += f"  🕐 {start_time} - {end_time} ({duration} мин) — {loc_str}\n"
+                    response += f"🕐 {start_time} - {end_time} ({duration} мин) — {loc_str}\n"
                 else:
-                    response += f"  🕐 {start_time} - {end_time} ({duration} мин)\n"
+                    response += f"🕐 {start_time} - {end_time} ({duration} мин)\n"
         else:
             if min_duration > 0:
                 response += f"❌ Нет общих свободных окон длительностью от {min_duration} минут\n"
@@ -1024,9 +1024,9 @@ class ScheduleService:
                             loc_str = "обе группы свободны, можно выбрать любую локацию"
                         else:
                             loc_str = f"обе группы в {locations[0]}"
-                        response += f"  🕐 {start_time} - {end_time} ({duration} мин) — {loc_str}\n"
+                        response += f"🕐 {start_time} - {end_time} ({duration} мин) — {loc_str}\n"
                     else:
-                        response += f"  🕐 {start_time} - {end_time} ({duration} мин)\n"
+                        response += f"🕐 {start_time} - {end_time} ({duration} мин)\n"
             
             current_date += timedelta(days=1)
             days_processed += 1
