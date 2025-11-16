@@ -7,6 +7,7 @@ from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
 from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import datetime, timedelta
+from contextlib import suppress
 
 from database.repository import UserRepository, ChatRepository
 from bot.services.schedule import schedule_service
@@ -16,12 +17,18 @@ from bot.services.state_manager import state_manager
 from bot.utils import (
     extract_group_from_text,
     build_role_selection_keyboard,
+    build_inline_keyboard,
     StateFilter
 )
 from loguru import logger
 
 
 router = Router()
+
+COMPARE_TEACHER_ACTION = "compare_teacher"
+MAX_COMPARE_TEACHER_PERIOD_DAYS = 10
+CHANGE_DATE_CALLBACK = "ct:change_date"
+SHOW_TEACHER_SCHEDULE_CALLBACK = "ct:teacher_schedule"
 
 
 @router.message(Command("start"))
@@ -107,6 +114,7 @@ async def cmd_help(message: Message, is_global_admin: bool = False):
 *Другое:*
 /compare\\_groups — сравнить расписания групп
   \\(укажи группы и минуты\\)
+/compare\\_teacher — сравнить группу с преподавателем
 /feedback — отправить отзыв
 """
     
@@ -558,3 +566,612 @@ async def process_compare_groups(message: Message, session: AsyncSession):
         response = await schedule_service.compare_groups(session, groups, date, min_duration)
     
     await message.answer(response)
+
+
+def _is_compare_teacher_flow(message: Message) -> bool:
+    state = state_manager.get_state(message.chat.id, message.from_user.id)
+    return bool(state and state.get('action') == COMPARE_TEACHER_ACTION)
+
+
+def _normalize_teacher_name(value: str) -> str:
+    return " ".join(value.split()) if value else ""
+
+
+def _build_cancel_keyboard():
+    return [[{"text": "❌ Отмена", "callback_data": "ct:cancel"}]]
+
+
+def _build_compare_result_keyboard(
+    include_schedule_button: bool = False
+):
+    buttons = []
+    
+    if include_schedule_button:
+        buttons.append([{
+            "text": "📋 Расписание преподавателя",
+            "callback_data": SHOW_TEACHER_SCHEDULE_CALLBACK
+        }])
+    
+    buttons.append([{
+        "text": "🔁 Поменять дату",
+        "callback_data": CHANGE_DATE_CALLBACK
+    }])
+    
+    buttons.extend(_build_cancel_keyboard())
+    return buttons
+
+
+async def _send_compare_teacher_prompt(
+    target_message: Message,
+    text: str,
+    buttons: list | None,
+    keyboard_cleanup_service=None
+):
+    markup = build_inline_keyboard(buttons) if buttons else None
+    sent = await target_message.answer(text, reply_markup=markup)
+    if markup and keyboard_cleanup_service:
+        await keyboard_cleanup_service.schedule_clear(sent.chat.id, sent.message_id)
+    return sent
+
+
+def _parse_teacher_date_input(text: str):
+    """
+    Parse date or date range for compare_teacher flow
+    Returns (start_date, end_date, error_message)
+    """
+    text = text.strip()
+    if not text:
+        return None, None, "❌ Укажи дату в формате ДД.ММ.ГГГГ или диапазон ДД.ММ.ГГГГ-ДД.ММ.ГГГГ."
+    
+    date_pattern = r'(\d{1,2})\.(\d{1,2})\.(\d{4})'
+    range_pattern = rf'^\s*{date_pattern}\s*-\s*{date_pattern}\s*$'
+    single_pattern = rf'^\s*{date_pattern}\s*$'
+    
+    range_match = re.match(range_pattern, text)
+    if range_match:
+        day1, month1, year1, day2, month2, year2 = range_match.groups()
+        try:
+            start_date = datetime(int(year1), int(month1), int(day1))
+            end_date = datetime(int(year2), int(month2), int(day2))
+        except ValueError:
+            return None, None, "❌ Некорректный диапазон дат."
+        
+        if end_date < start_date:
+            return None, None, "❌ Начальная дата должна быть раньше конечной."
+        
+        if (end_date - start_date).days > MAX_COMPARE_TEACHER_PERIOD_DAYS - 1:
+            return None, None, f"❌ Максимальный период — {MAX_COMPARE_TEACHER_PERIOD_DAYS} дней."
+        
+        return start_date, end_date, None
+    
+    single_match = re.match(single_pattern, text)
+    if single_match:
+        day, month, year = single_match.groups()
+        try:
+            date = datetime(int(year), int(month), int(day))
+            return date, None, None
+        except ValueError:
+            return None, None, "❌ Некорректная дата."
+    
+    return None, None, "❌ Укажи дату в формате ДД.ММ.ГГГГ или диапазон ДД.ММ.ГГГГ-ДД.ММ.ГГГГ."
+
+
+async def _transition_to_teacher_step(
+    message_obj: Message,
+    chat_id: int,
+    user_id: int,
+    group: str,
+    keyboard_cleanup_service=None
+):
+    state_manager.update_state(chat_id, user_id, {
+        'action': COMPARE_TEACHER_ACTION,
+        'step': 'teacher',
+        'group': group,
+        'suggestions': []
+    })
+    
+    text = (
+        f"✅ Группа {group} сохранена.\n\n"
+        "Теперь введи полное имя преподавателя (Фамилия Имя Отчество)."
+    )
+    await _send_compare_teacher_prompt(
+        message_obj,
+        text,
+        _build_cancel_keyboard(),
+        keyboard_cleanup_service
+    )
+
+
+async def _transition_to_date_step(
+    message_obj: Message,
+    chat_id: int,
+    user_id: int,
+    teacher_name: str,
+    keyboard_cleanup_service=None
+):
+    state = state_manager.get_state(chat_id, user_id) or {}
+    group = state.get('group')
+    
+    state_manager.update_state(chat_id, user_id, {
+        'action': COMPARE_TEACHER_ACTION,
+        'step': 'date',
+        'group': group,
+        'teacher': teacher_name,
+        'suggestions': []
+    })
+    
+    text = (
+        f"✅ Преподаватель: {teacher_name}\n\n"
+        "Укажи дату в формате ДД.ММ.ГГГГ или диапазон ДД.ММ.ГГГГ-ДД.ММ.ГГГГ "
+        f"(до {MAX_COMPARE_TEACHER_PERIOD_DAYS} дней). Можно использовать кнопки ниже."
+    )
+    buttons = [
+        [
+            {"text": "Сегодня", "callback_data": "ct:date:today"},
+            {"text": "Завтра", "callback_data": "ct:date:tomorrow"}
+        ],
+        *_build_cancel_keyboard()
+    ]
+    await _send_compare_teacher_prompt(
+        message_obj,
+        text,
+        buttons,
+        keyboard_cleanup_service
+    )
+
+
+async def _run_compare_teacher(
+    message_obj: Message,
+    session: AsyncSession,
+    group: str,
+    teacher_name: str,
+    start_date: datetime,
+    end_date: datetime | None,
+    keyboard_cleanup_service=None,
+    enable_teacher_schedule: bool = False
+):
+    if end_date:
+        response, has_windows = await schedule_service.compare_group_with_teacher_period(
+            session,
+            group,
+            teacher_name,
+            start_date,
+            end_date
+        )
+    else:
+        response, has_windows = await schedule_service.compare_group_with_teacher(
+            session,
+            group,
+            teacher_name,
+            start_date,
+            include_teacher_overview=False
+        )
+    
+    show_schedule_button = enable_teacher_schedule and not has_windows
+    markup = build_inline_keyboard(_build_compare_result_keyboard(show_schedule_button))
+    sent = await message_obj.answer(response, reply_markup=markup)
+    if keyboard_cleanup_service:
+        await keyboard_cleanup_service.schedule_clear(sent.chat.id, sent.message_id)
+
+
+async def _send_teacher_schedule_period(
+    message_obj: Message,
+    teacher_name: str,
+    start_date: datetime,
+    end_date: datetime
+):
+    if end_date < start_date:
+        start_date, end_date = end_date, start_date
+    
+    teacher_schedule = await schedule_service.fetch_schedule_by_teacher(teacher_name)
+    if not teacher_schedule:
+        await message_obj.answer(f"❌ Не удалось получить расписание преподавателя {teacher_name}")
+        return
+    
+    if start_date == end_date:
+        response = (
+            f"📚 Расписание преподавателя {teacher_name}\n"
+            f"Дата: {start_date.strftime('%d.%m.%Y')} ({schedule_service._get_weekday_name(start_date.weekday())})\n\n"
+        )
+    else:
+        response = (
+            f"📚 Расписание преподавателя {teacher_name}\n"
+            f"Период: {start_date.strftime('%d.%m.%Y')} – {end_date.strftime('%d.%m.%Y')}\n\n"
+        )
+    
+    schedule_type = '0'
+    current_date = start_date
+    
+    while current_date <= end_date:
+        lessons = schedule_service.get_schedule_for_date(teacher_schedule, current_date)
+        response += f"📅 {current_date.strftime('%d.%m.%Y')} ({schedule_service._get_weekday_name(current_date.weekday())})\n"
+        if not lessons:
+            response += "  Занятий нет\n\n"
+        else:
+            for lesson in lessons:
+                formatted = schedule_service.format_lesson(lesson, schedule_type=schedule_type)
+                response += formatted + "\n"
+            response += "\n"
+        current_date += timedelta(days=1)
+    
+    await message_obj.answer(response.strip())
+
+
+@router.message(Command("compare_teacher"))
+async def cmd_compare_teacher(
+    message: Message,
+    session: AsyncSession,
+    keyboard_cleanup_service=None
+):
+    """Команда /compare_teacher — сравнить группу с преподавателем"""
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    
+    default_group = None
+    if message.chat.type in ['group', 'supergroup']:
+        chat = await ChatRepository.get_by_id(session, chat_id)
+        if chat and chat.group:
+            default_group = chat.group
+    else:
+        user = await UserRepository.get_by_id(session, user_id)
+        if user and user.group:
+            default_group = user.group
+    
+    state_manager.set_state(chat_id, user_id, {
+        'action': COMPARE_TEACHER_ACTION,
+        'step': 'group'
+    })
+    
+    text = (
+        "🤝 Сравнение расписания группы с преподавателем\n\n"
+        "Укажи номер группы. Можно написать вручную или выбрать сохранённую кнопку ниже.\n"
+        "После этого бот попросит ввести ФИО преподавателя и дату.\n\n"
+        "Используй /cancel для отмены."
+    )
+    
+    buttons = []
+    if default_group:
+        buttons.append([{
+            "text": f"Использовать {default_group}",
+            "callback_data": f"ct:group:{default_group}"
+        }])
+    buttons.extend(_build_cancel_keyboard())
+    
+    await _send_compare_teacher_prompt(
+        message,
+        text,
+        buttons,
+        keyboard_cleanup_service
+    )
+
+
+@router.message(_is_compare_teacher_flow)
+async def process_compare_teacher_flow(
+    message: Message,
+    session: AsyncSession,
+    keyboard_cleanup_service=None
+):
+    """Обработка шагов команды /compare_teacher"""
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    state = state_manager.get_state(chat_id, user_id)
+    
+    if not state or state.get('action') != COMPARE_TEACHER_ACTION:
+        return
+    
+    step = state.get('step')
+    
+    if step == 'group':
+        group = extract_group_from_text(message.text)
+        if not group:
+            await message.answer("❌ Укажи группу в формате 000-000.")
+            return
+        await _transition_to_teacher_step(
+            message,
+            chat_id,
+            user_id,
+            group,
+            keyboard_cleanup_service
+        )
+        return
+    
+    if step == 'teacher':
+        teacher_raw = _normalize_teacher_name(message.text)
+        if len(teacher_raw) < 3:
+            await message.answer("❌ Укажи полное имя преподавателя (Фамилия Имя Отчество).")
+            return
+        
+        teachers_data = await schedule_service.fetch_teachers()
+        if not teachers_data:
+            await message.answer("❌ Не удалось получить список преподавателей. Попробуй позже.")
+            return
+        
+        teacher_name = None
+        teacher_lower = teacher_raw.lower()
+        for teacher in teachers_data:
+            name = teacher.get('name') or teacher.get('fullname')
+            if name and name.lower() == teacher_lower:
+                teacher_name = name
+                break
+        
+        if teacher_name:
+            await _transition_to_date_step(
+                message,
+                chat_id,
+                user_id,
+                teacher_name,
+                keyboard_cleanup_service
+            )
+            return
+        
+        suggestions = [
+            (teacher.get('name') or teacher.get('fullname'))
+            for teacher in teachers_data
+            if (teacher.get('name') or teacher.get('fullname', '')).lower().startswith(teacher_lower)
+        ]
+        suggestions = [s for s in suggestions if s][:3]
+        
+        state_manager.update_state(chat_id, user_id, {
+            'suggestions': suggestions,
+            'step': 'teacher',
+            'group': state.get('group')
+        })
+        
+        if suggestions:
+            buttons = [
+                [{
+                    "text": suggestion,
+                    "callback_data": f"ct:teacher_suggest:{idx}"
+                }]
+                for idx, suggestion in enumerate(suggestions)
+            ]
+            buttons.extend(_build_cancel_keyboard())
+            await _send_compare_teacher_prompt(
+                message,
+                "❌ Не нашёл такого преподавателя. Может быть, имелся в виду один из вариантов?",
+                buttons,
+                keyboard_cleanup_service
+            )
+        else:
+            await message.answer("❌ Не нашёл такого преподавателя. Попробуй снова указать ФИО полностью.")
+        return
+    
+    if step == 'date':
+        date_start, date_end, error = _parse_teacher_date_input(message.text)
+        if error:
+            await message.answer(error)
+            return
+        
+        group = state.get('group')
+        teacher_name = state.get('teacher')
+        
+        if not group or not teacher_name:
+            state_manager.delete_state(chat_id, user_id)
+            await message.answer("❌ Данные устарели. Запусти /compare_teacher заново.")
+            return
+        
+        await _run_compare_teacher(
+            message,
+            session,
+            group,
+            teacher_name,
+            date_start,
+            date_end,
+            keyboard_cleanup_service,
+            enable_teacher_schedule=True
+        )
+        state_manager.update_state(chat_id, user_id, {
+            'action': COMPARE_TEACHER_ACTION,
+            'step': 'date',
+            'group': group,
+            'teacher': teacher_name,
+            'suggestions': [],
+            'period_start': date_start.isoformat(),
+            'period_end': (date_end or date_start).isoformat()
+        })
+
+
+@router.callback_query(F.data.startswith("ct:group:"))
+async def process_compare_teacher_group_callback(
+    callback: CallbackQuery,
+    keyboard_cleanup_service=None
+):
+    chat_id = callback.message.chat.id
+    user_id = callback.from_user.id
+    state = state_manager.get_state(chat_id, user_id)
+    
+    if not state or state.get('action') != COMPARE_TEACHER_ACTION:
+        await callback.answer("⏱ Время ожидания истекло. Запусти /compare_teacher заново.")
+        return
+    
+    group = callback.data.split(":", 2)[2]
+    await _transition_to_teacher_step(
+        callback.message,
+        chat_id,
+        user_id,
+        group,
+        keyboard_cleanup_service
+    )
+    with suppress(Exception):
+        await callback.message.edit_reply_markup()
+    await callback.answer(f"Группа {group} выбрана")
+
+
+@router.callback_query(F.data.startswith("ct:teacher_suggest:"))
+async def process_compare_teacher_suggestion_callback(
+    callback: CallbackQuery,
+    keyboard_cleanup_service=None
+):
+    chat_id = callback.message.chat.id
+    user_id = callback.from_user.id
+    state = state_manager.get_state(chat_id, user_id)
+    
+    if not state or state.get('action') != COMPARE_TEACHER_ACTION or state.get('step') != 'teacher':
+        await callback.answer("⏱ Сессия истекла.")
+        return
+    
+    suggestions = state.get('suggestions') or []
+    try:
+        idx = int(callback.data.split(":")[2])
+    except (ValueError, IndexError):
+        await callback.answer("❌ Некорректный выбор.")
+        return
+    
+    if idx < 0 or idx >= len(suggestions):
+        await callback.answer("❌ Этот вариант больше недоступен.")
+        return
+    
+    teacher_name = suggestions[idx]
+    await _transition_to_date_step(
+        callback.message,
+        chat_id,
+        user_id,
+        teacher_name,
+        keyboard_cleanup_service
+    )
+    with suppress(Exception):
+        await callback.message.edit_reply_markup()
+    await callback.answer(f"Выбран преподаватель: {teacher_name}")
+
+
+@router.callback_query(F.data.startswith("ct:date:"))
+async def process_compare_teacher_date_callback(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    keyboard_cleanup_service=None
+):
+    chat_id = callback.message.chat.id
+    user_id = callback.from_user.id
+    state = state_manager.get_state(chat_id, user_id)
+    
+    if not state or state.get('action') != COMPARE_TEACHER_ACTION or state.get('step') != 'date':
+        await callback.answer("⏱ Сессия истекла.")
+        return
+    
+    group = state.get('group')
+    teacher_name = state.get('teacher')
+    if not group or not teacher_name:
+        state_manager.delete_state(chat_id, user_id)
+        await callback.answer("❌ Данные устарели.")
+        return
+    
+    token = callback.data.split(":", 2)[2]
+    base_date = datetime.now()
+    if token == "today":
+        start_date = base_date
+        end_date = None
+        answer_text = "Сегодня"
+    elif token == "tomorrow":
+        start_date = base_date + timedelta(days=1)
+        end_date = None
+        answer_text = "Завтра"
+    else:
+        await callback.answer("❌ Неизвестный выбор.")
+        return
+    
+    await _run_compare_teacher(
+        callback.message,
+        session,
+        group,
+        teacher_name,
+        start_date,
+        end_date,
+        keyboard_cleanup_service,
+        enable_teacher_schedule=True
+    )
+    state_manager.update_state(chat_id, user_id, {
+        'action': COMPARE_TEACHER_ACTION,
+        'step': 'date',
+        'group': group,
+        'teacher': teacher_name,
+        'suggestions': [],
+        'period_start': start_date.isoformat(),
+        'period_end': (end_date or start_date).isoformat()
+    })
+    with suppress(Exception):
+        await callback.message.edit_reply_markup()
+    await callback.answer(f"Дата: {answer_text}")
+
+
+@router.callback_query(F.data == CHANGE_DATE_CALLBACK)
+async def process_compare_teacher_change_date_callback(
+    callback: CallbackQuery,
+    keyboard_cleanup_service=None
+):
+    chat_id = callback.message.chat.id
+    user_id = callback.from_user.id
+    state = state_manager.get_state(chat_id, user_id)
+    
+    if not state or state.get('action') != COMPARE_TEACHER_ACTION:
+        await callback.answer("⏱ Сессия истекла.")
+        return
+    
+    group = state.get('group')
+    teacher_name = state.get('teacher')
+    if not group or not teacher_name:
+        state_manager.delete_state(chat_id, user_id)
+        await callback.answer("❌ Данные устарели.")
+        return
+    
+    await _transition_to_date_step(
+        callback.message,
+        chat_id,
+        user_id,
+        teacher_name,
+        keyboard_cleanup_service
+    )
+    with suppress(Exception):
+        await callback.message.edit_reply_markup()
+    await callback.answer("Выбери новую дату")
+
+
+@router.callback_query(F.data == SHOW_TEACHER_SCHEDULE_CALLBACK)
+async def process_compare_teacher_schedule_callback(
+    callback: CallbackQuery
+):
+    chat_id = callback.message.chat.id
+    user_id = callback.from_user.id
+    state = state_manager.get_state(chat_id, user_id)
+    
+    if not state or state.get('action') != COMPARE_TEACHER_ACTION:
+        await callback.answer("⏱ Сессия истекла.")
+        return
+    
+    teacher_name = state.get('teacher')
+    start_iso = state.get('period_start')
+    end_iso = state.get('period_end')
+    
+    if not (teacher_name and start_iso and end_iso):
+        await callback.answer("❌ Сначала выполните сравнение за период.")
+        return
+    
+    try:
+        start_date = datetime.fromisoformat(start_iso)
+        end_date = datetime.fromisoformat(end_iso)
+    except ValueError:
+        await callback.answer("❌ Данные периода повреждены.")
+        return
+    
+    await _send_teacher_schedule_period(
+        callback.message,
+        teacher_name,
+        start_date,
+        end_date
+    )
+    await callback.answer("Показываю расписание")
+
+
+@router.callback_query(F.data == "ct:cancel")
+async def process_compare_teacher_cancel(callback: CallbackQuery):
+    chat_id = callback.message.chat.id
+    user_id = callback.from_user.id
+    state = state_manager.get_state(chat_id, user_id)
+    
+    if state and state.get('action') == COMPARE_TEACHER_ACTION:
+        state_manager.delete_state(chat_id, user_id)
+        await callback.message.answer("❌ Сравнение с преподавателем отменено.")
+        with suppress(Exception):
+            await callback.message.edit_reply_markup()
+        await callback.answer("Отменено")
+    else:
+        await callback.answer()

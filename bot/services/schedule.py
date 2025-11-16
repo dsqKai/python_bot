@@ -3,8 +3,9 @@
 """
 import re
 import json
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple, Any
 from datetime import datetime, timedelta
+from urllib.parse import quote
 from loguru import logger
 
 from config import Constants
@@ -479,13 +480,18 @@ class ScheduleService:
         # Выполняем запрос через API клиент
         data = await self.api.get(endpoint)
         
-        if data and "teachers" in data:
-            teachers_data = data["teachers"]
+        if data:
+            teachers_data: Optional[List[Dict[str, Any]]] = None
+            if isinstance(data, dict):
+                teachers_data = data.get("teachers")
+            elif isinstance(data, list):
+                teachers_data = data
             
-            # Сохраняем в кэш на 7 дней
-            self.cache.set(cache_key, teachers_data, ttl_hours=168)
+            if teachers_data:
+                self.cache.set(cache_key, teachers_data, ttl_hours=168)
+                return teachers_data
             
-            return teachers_data
+            logger.warning("Unexpected teachers response format: %s", type(data).__name__)
         
         return None
     
@@ -511,7 +517,8 @@ class ScheduleService:
             return cached
         
         # Endpoint: GET /api/v1/schedules/teacher/fn/{fn}
-        endpoint = f"/api/v1/schedules/teacher/fn/{teacher_fullname}"
+        encoded_name = quote(teacher_fullname)
+        endpoint = f"/api/v1/schedules/teacher/fn/{encoded_name}"
         
         params = {}
         if is_session:
@@ -573,6 +580,15 @@ class ScheduleService:
         hours = minutes // 60
         mins = minutes % 60
         return f"{hours:02d}:{mins:02d}"
+
+    def _is_sunday(self, date: datetime) -> bool:
+        """Проверить, является ли дата воскресеньем"""
+        return date.weekday() == 6
+    
+    def _is_webinar_lesson(self, lesson: Dict) -> bool:
+        """Проверить, относится ли занятие к онлайн вебинару (без очного присутствия)"""
+        location = (lesson.get('location') or '').strip().lower()
+        return location == "webinar"
     
     def _get_busy_intervals(self, lessons: List[Dict], schedule_type: str = '0') -> List[Tuple[int, int, Optional[str]]]:
         """
@@ -589,6 +605,8 @@ class ScheduleService:
         intervals = []
         
         for lesson in lessons:
+            if self._is_webinar_lesson(lesson):
+                continue
             pair_num = lesson.get('pair_number', 0)
             time_slot = times.get(pair_num, "")
             if not time_slot:
@@ -758,11 +776,12 @@ class ScheduleService:
             if is_any_busy:
                 continue
             
-            # Если все локации None - у всех групп нет пар вообще
-            if all(loc is None for loc in locations):
-                free_intervals.append((interval_start, interval_end, {"Любая": len(timelines)}))
+            # Если у всех нет привязки к корпусу — пропускаем (нельзя гарантировать встречу)
+            if all(not loc for loc in locations):
+                continue
+            
             # Если все локации одинаковые (и не None)
-            elif len(set(locations)) == 1 and locations[0]:
+            if len(set(locations)) == 1 and locations[0]:
                 free_intervals.append((interval_start, interval_end, {locations[0]: len(timelines)}))
         
         return free_intervals
@@ -835,6 +854,40 @@ class ScheduleService:
         
         return free_intervals
     
+    def _format_lessons_overview(
+        self,
+        lessons: List[Dict],
+        times: Dict[int, str]
+    ) -> str:
+        """
+        Сформировать краткое описание списка занятий
+        """
+        filtered = [lesson for lesson in lessons if not self._is_webinar_lesson(lesson)]
+        
+        if not filtered:
+            return "  Занятий нет\n"
+        
+        lines = []
+        for lesson in filtered:
+            pair_num = lesson.get('pair_number', 0)
+            time_slot = times.get(pair_num, "??:??-??:??")
+            subject = lesson.get('subject', 'Предмет не указан')
+            location = lesson.get('location', '')
+            rooms = lesson.get('rooms', [])
+            
+            location_str = ""
+            if location:
+                location_str = f" [{location}]"
+            elif rooms:
+                if isinstance(rooms, list) and rooms:
+                    location_str = f" [{rooms[0]}]"
+                elif isinstance(rooms, str):
+                    location_str = f" [{rooms}]"
+            
+            lines.append(f"  {time_slot}: {subject}{location_str}")
+        
+        return "\n".join(lines) + "\n"
+    
     async def compare_groups(
         self,
         session: AsyncSession,
@@ -858,6 +911,12 @@ class ScheduleService:
         """
         if len(groups) < 2:
             return "❌ Для сравнения нужно указать минимум 2 группы"
+        
+        if self._is_sunday(date):
+            return (
+                f"📅 {date.strftime('%d.%m.%Y')} ({self._get_weekday_name(date.weekday())})\n"
+                "❌ По воскресеньям пары не проводятся, сравнение не требуется."
+            )
         
         # Получаем расписания для всех групп
         schedules = {}
@@ -993,6 +1052,10 @@ class ScheduleService:
         times = self.times.get(schedule_type, {})
         
         while current_date <= end_date:
+            if self._is_sunday(current_date):
+                current_date += timedelta(days=1)
+                continue
+            
             # Получаем занятия для каждой группы на текущую дату
             day_schedules = {}
             for group in groups:
@@ -1035,6 +1098,179 @@ class ScheduleService:
             response += "\n❌ Нет дней для анализа\n"
         
         return response.strip()
+    
+    async def compare_group_with_teacher(
+        self,
+        session: AsyncSession,
+        group: str,
+        teacher_fullname: str,
+        date: datetime,
+        min_duration: int = 0,
+        is_session: bool = False,
+        include_teacher_overview: bool = True
+    ) -> Tuple[str, bool]:
+        """
+        Найти общие свободные окна между группой и преподавателем на дату
+        """
+        group_schedule = await self.fetch_schedule(group, is_session)
+        if not group_schedule:
+            return f"❌ Не удалось получить расписание для группы {group}", False
+        
+        if self._is_sunday(date):
+            return (
+                f"📅 {date.strftime('%d.%m.%Y')} ({self._get_weekday_name(date.weekday())})\n"
+                "❌ По воскресеньям пары не проводятся, сравнение не требуется.",
+                False
+            )
+        
+        teacher_schedule = await self.fetch_schedule_by_teacher(teacher_fullname, is_session)
+        if not teacher_schedule:
+            return f"❌ Не удалось получить расписание преподавателя {teacher_fullname}", False
+        
+        group_lessons = self.get_schedule_for_date(group_schedule, date)
+        teacher_lessons = self.get_schedule_for_date(teacher_schedule, date)
+        
+        schedule_type = '0'
+        times = self.times.get(schedule_type, {})
+        
+        busy_group = self._get_busy_intervals(group_lessons, schedule_type)
+        busy_teacher = self._get_busy_intervals(teacher_lessons, schedule_type)
+        
+        free_intervals = self._find_free_intervals_with_location(
+            [busy_group, busy_teacher],
+            min_duration
+        )
+        
+        response = (
+            f"🤝 Окна для встречи на {date.strftime('%d.%m.%Y')} "
+            f"({self._get_weekday_name(date.weekday())})\n"
+            f"Группа: {group}\n"
+            f"Преподаватель: {teacher_fullname}\n"
+        )
+        if min_duration > 0:
+            response += f"Минимальная длительность окна: {min_duration} мин\n"
+        response += "📍 Учитываются локации корпусов\n\n"
+        
+        has_windows = bool(free_intervals)
+        
+        if has_windows:
+            response += "✅ Свободные окна:\n"
+            for start, end, loc_info in free_intervals:
+                start_time = self._minutes_to_time(start)
+                end_time = self._minutes_to_time(end)
+                duration = end - start
+                
+                locations = list(loc_info.keys())
+                if locations:
+                    if locations[0] == "Любая":
+                        loc_str = "можно выбрать любую локацию"
+                    else:
+                        loc_str = f"обе стороны в {locations[0]}"
+                    response += f"🕐 {start_time} - {end_time} ({duration} мин) — {loc_str}\n"
+                else:
+                    response += f"🕐 {start_time} - {end_time} ({duration} мин)\n"
+        else:
+            if min_duration > 0:
+                response += f"❌ Нет общих свободных окон длительностью от {min_duration} минут\n"
+            else:
+                response += "❌ Нет общих свободных окон\n"
+        
+        response += "\n📚 Расписание:\n"
+        response += f"Группа {group}:\n"
+        response += self._format_lessons_overview(group_lessons, times)
+        if include_teacher_overview:
+            response += f"{teacher_fullname}:\n"
+            response += self._format_lessons_overview(teacher_lessons, times)
+        
+        return response.strip(), has_windows
+    
+    async def compare_group_with_teacher_period(
+        self,
+        session: AsyncSession,
+        group: str,
+        teacher_fullname: str,
+        start_date: datetime,
+        end_date: datetime,
+        min_duration: int = 0,
+        is_session: bool = False
+    ) -> Tuple[str, bool]:
+        """
+        Найти общие окна между группой и преподавателем за период
+        """
+        if end_date < start_date:
+            start_date, end_date = end_date, start_date
+        
+        group_schedule = await self.fetch_schedule(group, is_session)
+        if not group_schedule:
+            return f"❌ Не удалось получить расписание для группы {group}", False
+        
+        teacher_schedule = await self.fetch_schedule_by_teacher(teacher_fullname, is_session)
+        if not teacher_schedule:
+            return f"❌ Не удалось получить расписание преподавателя {teacher_fullname}", False
+        
+        response = (
+            "🤝 Окна для встречи на период\n"
+            f"с {start_date.strftime('%d.%m.%Y')} по {end_date.strftime('%d.%m.%Y')}\n"
+            f"Группа: {group}\n"
+            f"Преподаватель: {teacher_fullname}\n"
+        )
+        if min_duration > 0:
+            response += f"Минимальная длительность окна: {min_duration} мин\n"
+        response += "📍 Учитываются локации корпусов\n"
+        
+        schedule_type = '0'
+        any_windows = False
+        current_date = start_date
+        
+        while current_date <= end_date:
+            if self._is_sunday(current_date):
+                current_date += timedelta(days=1)
+                continue
+            
+            group_lessons = self.get_schedule_for_date(group_schedule, current_date)
+            teacher_lessons = self.get_schedule_for_date(teacher_schedule, current_date)
+            
+            busy_group = self._get_busy_intervals(group_lessons, schedule_type)
+            busy_teacher = self._get_busy_intervals(teacher_lessons, schedule_type)
+            
+            free_intervals = self._find_free_intervals_with_location(
+                [busy_group, busy_teacher],
+                min_duration
+            )
+            
+            if free_intervals:
+                any_windows = True
+                response += (
+                    f"\n📅 {current_date.strftime('%d.%m.%Y')} "
+                    f"({self._get_weekday_name(current_date.weekday())})\n"
+                )
+                for start, end, loc_info in free_intervals:
+                    start_time = self._minutes_to_time(start)
+                    end_time = self._minutes_to_time(end)
+                    duration = end - start
+                    
+                    locations = list(loc_info.keys())
+                    if locations:
+                        if locations[0] == "Любая":
+                            loc_str = "можно выбрать любую локацию"
+                        else:
+                            loc_str = f"обе стороны в {locations[0]}"
+                        response += f"🕐 {start_time} - {end_time} ({duration} мин) — {loc_str}\n"
+                    else:
+                        response += f"🕐 {start_time} - {end_time} ({duration} мин)\n"
+            
+            current_date += timedelta(days=1)
+        
+        if not any_windows:
+            if min_duration > 0:
+                response += (
+                    "\n❌ Нет общих свободных окон с заданной длительностью "
+                    "в выбранном периоде"
+                )
+            else:
+                response += "\n❌ Нет общих свободных окон в выбранном периоде"
+        
+        return response.strip(), any_windows
 
 
 # Глобальный экземпляр сервиса расписания
