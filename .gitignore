@@ -47,9 +47,9 @@ logs/
 *.db
 *.sqlite3
 
-# Alembic
-alembic/versions/*.py
-!alembic/versions/.gitkeep
+# # Alembic
+# alembic/versions/*.py
+# !alembic/versions/.gitkeep
 
 # OS
 .DS_Store
