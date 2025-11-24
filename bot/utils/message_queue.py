@@ -208,6 +208,10 @@ class MessageQueue:
                 logger.warning(f"Rate limit hit: {e}")
                 await asyncio.sleep(5)  # Ждем 5 секунд
             
+            if 'message is not modified' in error_str:
+                logger.debug(f"Ignoring noop edit: {e}")
+                return True
+            
             logger.error(f"Failed to send message: {e}")
             return False
     

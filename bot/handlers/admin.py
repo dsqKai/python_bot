@@ -202,6 +202,8 @@ async def cmd_cancel(message: Message):
         await message.answer("✅ Рассылка отменена")
     elif action == 'awaiting_compare_groups':
         await message.answer("✅ Сравнение групп отменено")
+    elif action == 'compare_teacher':
+        await message.answer("✅ Сравнение с преподавателем отменено")
     else:
         await message.answer("✅ Действие отменено")
 
