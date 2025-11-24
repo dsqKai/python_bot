@@ -1175,13 +1175,6 @@ class ScheduleService:
             else:
                 response += "❌ Нет общих свободных окон\n"
         
-        response += "\n📚 Расписание:\n"
-        response += f"Группа {group}:\n"
-        response += self._format_lessons_overview(group_lessons, times)
-        if include_teacher_overview:
-            response += f"{teacher_fullname}:\n"
-            response += self._format_lessons_overview(teacher_lessons, times)
-        
         return response.strip(), has_windows
     
     async def compare_group_with_teacher_period(
